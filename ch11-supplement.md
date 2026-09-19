@@ -69,6 +69,366 @@
 - 延迟增加但成本降低 10 倍以上
 - 2024 年被 Confluent 收购
 
+## 工业界中间件软件实践
+
+### 流处理中间件：Apache Kafka
+
+Kafka 是流处理生态的核心基础设施，提供分区日志（Partitioned Log）抽象：
+
+```
+Kafka 核心概念：
+  Topic → 分区（Partition）→ 段（Segment）→ 偏移量（Offset）
+
+  生产者写入：Key → hash(Key) mod num_partitions → Partition Leader
+  消费者读取：Consumer Group → 每个分区被一个消费者消费
+```
+
+**Kafka 生产者配置：**
+
+```java
+// Java Kafka 生产者：精确一次语义
+Properties props = new Properties();
+props.put("bootstrap.servers", "kafka:9092");
+props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+
+// 幂等生产者：避免重试导致重复
+props.put("enable.idempotence", true);
+props.put("acks", "all");
+props.put("max.in.flight.requests.per.connection", 5);
+props.put("retries", 3);
+
+// 批量和压缩
+props.put("batch.size", 16384);        // 批量大小 16KB
+props.put("linger.ms", 10);            // 等待 10ms 凑批
+props.put("compression.type", "zstd");  // ZSTD 压缩
+props.put("buffer.memory", 33554432);   // 32MB 缓冲区
+
+Producer<String, String> producer = new KafkaProducer<>(props);
+```
+
+**Kafka 消费者配置：**
+
+```java
+// Java Kafka 消费者：精确一次语义
+Properties props = new Properties();
+props.put("bootstrap.servers", "kafka:9092");
+props.put("group.id", "order-processor");
+props.put("enable.auto.commit", "false");           // 手动提交偏移量
+props.put("auto.offset.reset", "earliest");
+props.put("isolation.level", "read_committed");     // 只读取已提交的事务消息
+props.put("max.poll.records", 500);                 // 单次拉取最多 500 条
+props.put("max.poll.interval.ms", 300000);          // 5分钟超时
+
+KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+consumer.subscribe(Arrays.asList("orders"));
+
+while (running) {
+    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+    for (ConsumerRecord<String, String> record : records) {
+        process(record.value());
+    }
+    // 手动同步提交
+    consumer.commitSync();
+}
+```
+
+### 流处理中间件：Apache Flink
+
+Flink 是 2026 年流处理领域的标杆，支持精确一次、事件时间语义和状态管理：
+
+**Flink DataStream API：**
+
+```java
+// Flink Java：实时订单处理
+StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+// 精确一次语义
+env.enableCheckpointing(60000);  // 每60秒 checkpoint
+env.getCheckpointConfig().setCheckpointingMode(EXACTLY_ONCE);
+env.getCheckpointConfig().setMinPauseBetweenCheckpoints(30000);
+env.getCheckpointConfig().setCheckpointTimeout(60000);
+env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+
+// 从 Kafka 消费
+KafkaSource<String> source = KafkaSource.<String>builder()
+    .setBootstrapServers("kafka:9092")
+    .setTopics("orders")
+    .setGroupId("order-processor")
+    .setStartingOffsets(OffsetsInitializer.earliest())
+    .setValueOnlyDeserializer(new SimpleStringSchema())
+    .build();
+
+DataStream<String> orders = env.fromSource(
+    source,
+    WatermarkStrategy.forBoundedOutOfOrderness(Duration.ofSeconds(5)),  // 允许5秒乱序
+    "kafka-orders"
+);
+
+// 按用户分组，每5分钟窗口统计消费总额
+orders
+    .map(s -> parseOrder(s))  // JSON → Order 对象
+    .keyBy(Order::getCustomerId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))
+    .aggregate(new SumAggregator())
+    .sinkTo(KafkaSink.<Double>builder()
+        .setBootstrapServers("kafka:9092")
+        .setRecordSerializer(new UserSpentSerializer("user-spent"))
+        .setDeliveryGuarantee(DeliveryGuarantee.EXACTLY_ONCE)
+        .build()
+    );
+
+env.execute("Order Processing");
+```
+
+**Flink SQL（Table API）：**
+
+```sql
+-- Flink SQL：定义流表
+-- Kafka 源表（流式）
+CREATE TABLE orders_stream (
+    order_id STRING,
+    customer_id STRING,
+    total DECIMAL(10, 2),
+    order_time TIMESTAMP(3),
+    -- 事件时间字段和水印
+    WATERMARK FOR order_time AS order_time - INTERVAL '5' SECOND
+) WITH (
+    'connector' = 'kafka',
+    'topic' = 'orders',
+    'properties.bootstrap.servers' = 'kafka:9092',
+    'format' = 'avro-confluent',
+    'avro-confluent.url' = 'http://schema-registry:8081',
+    'scan.startup.mode' = 'group-offsets'
+);
+
+-- 滚动窗口聚合
+SELECT
+    customer_id,
+    TUMBLE_START(order_time, INTERVAL '5' MINUTE) AS window_start,
+    SUM(total) AS total_spent,
+    COUNT(*) AS order_count
+FROM orders_stream
+GROUP BY
+    customer_id,
+    TUMBLE(order_time, INTERVAL '5' MINUTE);
+```
+
+### 流式数据库中间件：RisingWave
+
+RisingWave 让流处理像使用普通数据库一样简单：
+
+```sql
+-- RisingWave：定义流式物化视图
+
+-- 从 Kafka 消费订单流
+CREATE SOURCE orders (
+    order_id VARCHAR,
+    customer_id VARCHAR,
+    total NUMERIC,
+    order_time TIMESTAMP
+) WITH (
+    connector = 'kafka',
+    topic = 'orders',
+    properties.bootstrap.server = 'kafka:9092',
+    scan.startup.mode = 'earliest'
+) FORMAT PLAIN ENCODE JSON;
+
+-- 实时物化视图：自动增量维护
+CREATE MATERIALIZED VIEW daily_revenue AS
+SELECT
+    customer_id,
+    date_trunc('day', order_time) AS day,
+    SUM(total) AS revenue,
+    COUNT(*) AS order_count
+FROM orders
+GROUP BY customer_id, date_trunc('day', order_time);
+
+-- 查询物化视图（延迟极低，因为已预计算）
+SELECT * FROM daily_revenue WHERE day = '2026-09-19';
+
+-- 复杂 JOIN：流 + 流
+CREATE MATERIALIZED VIEW high_value_customers AS
+SELECT
+    d.customer_id,
+    d.revenue,
+    c.country
+FROM daily_revenue d
+JOIN customers c ON d.customer_id = c.id
+WHERE d.revenue > 10000;
+```
+
+### CDC 中间件：Debezium + Flink CDC
+
+**Flink CDC：无锁全量 + 增量同步：**
+
+```sql
+-- Flink CDC 3.0：完整管道定义
+-- 源表：MySQL CDC
+CREATE TABLE mysql_orders (
+    order_id BIGINT,
+    customer_id VARCHAR,
+    total DECIMAL(10,2),
+    status VARCHAR,
+    create_time TIMESTAMP(3),
+    update_time TIMESTAMP(3),
+    PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+    'connector' = 'mysql-cdc',
+    'hostname' = 'mysql.db',
+    'port' = '3306',
+    'username' = 'flink',
+    'password' = '***',
+    'database-name' = 'ecommerce',
+    'table-name' = 'orders',
+    'scan.startup.mode' = 'initial',
+    'scan.incremental.snapshot.enabled' = 'true',  -- 无锁快照
+    'scan.snapshot.fetch.size' = '1024'
+);
+
+-- Sink：Iceberg
+CREATE TABLE iceberg_orders (
+    order_id BIGINT,
+    customer_id VARCHAR,
+    total DECIMAL(10,2),
+    status VARCHAR,
+    create_time TIMESTAMP(3),
+    update_time TIMESTAMP(3),
+    PRIMARY KEY (order_id) NOT ENFORCED
+) WITH (
+    'connector' = 'iceberg',
+    'catalog' = 'default_catalog',
+    'warehouse' = 's3://warehouse/',
+    'format' = 'parquet',
+    'write.format.default' = 'parquet'
+);
+
+-- 同步管道
+INSERT INTO iceberg_orders
+SELECT * FROM mysql_orders;
+```
+
+### 消息系统中间件：Pulsar
+
+Pulsar 的存算分离架构使其在云原生场景有独特优势：
+
+```
+Pulsar 架构：
+  Producer → Broker（无状态，只转发）→ BookKeeper（分布式日志存储）
+              ↑                              ↑
+         计算层（可弹性伸缩）         存储层（独立扩展）
+```
+
+```java
+// Pulsar Java 生产者
+Producer<String> producer = client.newProducer(Schema.STRING)
+    .topic("orders")
+    .enableBatching(true)
+    .batchingMaxMessages(1000)
+    .batchingMaxPublishDelay(10, TimeUnit.MILLISECONDS)
+    .compressionType(CompressionType.ZSTD)
+    .sendTimeout(10, TimeUnit.SECONDS)
+    .create();
+
+// Pulsar 事务
+client.newTransaction()
+    .withTransactionTimeout(30, TimeUnit.SECONDS)
+    .build()
+    .thenAccept(txn -> {
+        producer.newMessage(txn)
+            .value("order-1")
+            .send();
+
+        producer.newMessage(txn)
+            .value("order-2")
+            .send();
+
+        txn.commit();  // 原子提交
+    });
+```
+
+### 消息系统中间件：Redpanda / WarpStream
+
+**Redpanda——C++ 实现的高性能 Kafka 替代：**
+
+```bash
+# Redpanda 单二进制部署，无需 JVM/ZooKeeper
+rpk cluster config set kafka_batch_max_bytes 1048576
+rpk topic create orders --partitions 6 --replicas 3
+
+# Redpanda 完全兼容 Kafka 协议
+# 应用代码无需修改，只需改 bootstrap servers
+# kafka:9092 → redpanda:9092
+```
+
+**WarpStream——S3 原生 Kafka：**
+
+```bash
+# WarpStream：日志直接存储在 S3
+# 生产者配置
+producer.boostrap.servers=warpstream-agent:9092
+producer.client.id=order-producer
+producer.acks=all
+
+# Agent 将日志写入 S3 的 WAL 对象
+# 消费者从 S3 拉取数据
+# 无需本地磁盘，成本降低 10 倍
+```
+
+### 流处理 AI 中间件：实时 RAG 管道
+
+```python
+# 实时 RAG：CDC → 流处理 → 向量数据库 → LLM
+from pyflink.datastream import StreamExecutionEnvironment
+from pyflink.table import StreamTableEnvironment
+
+env = StreamExecutionEnvironment.getExecutionEnvironment()
+t_env = StreamTableEnvironment.create(env)
+
+# 1. 从 CDC 消费文档变更
+t_env.execute_sql("""
+    CREATE TABLE document_changes (
+        doc_id STRING,
+        content STRING,
+        operation STRING,
+        change_time TIMESTAMP(3)
+    ) WITH (
+        'connector' = 'mongodb-cdc',
+        'hosts' = 'mongo:27017',
+        'database' = 'knowledge',
+        'collection' = 'documents'
+    )
+""")
+
+# 2. 调用 Embedding 服务（UDF）
+t_env.create_temporary_function(
+    "generate_embedding",
+    EmbeddingUDF,  # 调用 LLM API 生成向量
+    ["STRING"]
+)
+
+# 3. 写入向量数据库（实时更新知识库）
+t_env.execute_sql("""
+    CREATE TABLE vector_store (
+        doc_id STRING,
+        content STRING,
+        embedding ARRAY<FLOAT>,
+        change_time TIMESTAMP(3)
+    ) WITH (
+        'connector' = 'milvus',
+        'host' = 'milvus:19530',
+        'collection' = 'documents'
+    )
+""")
+
+t_env.execute_sql("""
+    INSERT INTO vector_store
+    SELECT doc_id, content, generate_embedding(content), change_time
+    FROM document_changes
+    WHERE operation IN ('INSERT', 'UPDATE')
+""")
+```
+
 ## 2026 年工业界最新进展
 
 ### 流式数据库的兴起

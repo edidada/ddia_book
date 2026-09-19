@@ -67,6 +67,284 @@
 - 写入时异步更新索引，最终一致
 - 利用流处理引擎优化索引维护路径
 
+## 工业界中间件软件实践
+
+### 哈希分片中间件：Cassandra / ScyllaDB
+
+Cassandra 使用一致性哈希 + 虚拟节点进行分区：
+
+```
+Cassandra 分区路由流程：
+  1. 数据写入：(partition_key, clustering_key) → Murmur3Hash(partition_key)
+  2. 根据 Token 环定位节点：hash → token → 负责该 token range 的节点
+  3. 复制策略：NetworkTopologyStrategy 将副本分布到不同数据中心和机架
+```
+
+```sql
+-- Cassandra 分区设计示例
+CREATE TABLE orders (
+    customer_id text,           -- 分区键
+    order_id timeuuid,           -- 聚簇列
+    total decimal,
+    status text,
+    PRIMARY KEY ((customer_id), order_id)  -- 注意双重括号
+) WITH CLUSTERING ORDER BY (order_id DESC);
+
+-- 复合分区键：避免热点，提高均匀性
+CREATE TABLE events (
+    bucket text,        -- 分区键1：按天分桶
+    event_type text,     -- 分区键2
+    event_id timeuuid,
+    data text,
+    PRIMARY KEY ((bucket, event_type), event_id)
+);
+```
+
+**虚拟节点配置：**
+
+```yaml
+# cassandra.yaml 配置
+num_tokens: 16          # 每节点 16 个虚拟节点（默认 256，新版减少以优化路由）
+partitioner: org.apache.cassandra.dht.Murmur3Partitioner
+endpoint_snitch: GossipingPropertyFileSnitch
+
+# 数据中心拓扑
+datacenter1:
+  rack1: [node1, node2, node3]
+  rack2: [node4, node5, node6]
+```
+
+### 范围分片中间件：HBase / TiKV
+
+**HBase 的 Region 分区——自动分裂：**
+
+```
+HBase 分区结构：
+  Table
+    └─ Region（默认初始1个，按数据量自动分裂）
+       └─ Store（每个 Column Family 一个）
+          └─ HFile（LSM-Tree 的 SSTable）
+```
+
+```java
+// HBase：手动预分区（避免热点）
+Admin admin = connection.getAdmin();
+
+// 预创建分区：按 RowKey 范围分割
+byte[][] splitKeys = new byte[][] {
+    Bytes.toBytes("1000"),
+    Bytes.toBytes("2000"),
+    Bytes.toBytes("3000"),
+    // ...
+};
+admin.createTable(
+    TableDescriptorBuilder.newBuilder(TableName.valueOf("orders"))
+        .setColumnFamily(ColumnFamilyDescriptorBuilder.newBuilder("cf".getBytes()).build())
+        .build(),
+    splitKeys  // 预分区
+);
+
+// 行键设计：避免热点和连续写入
+// [reverse(userId)][timestamp] → 分散写入到多个 Region
+String rowKey = reverse(userId) + ":" + System.currentTimeMillis();
+```
+
+**TiKV 的 Range 分区——基于 PD 调度：**
+
+```
+TiKV 架构：
+  TiDB SQL 层（无状态）
+  PD（Placement Driver）：元数据管理和调度
+  TiKV（Region 分布在各节点）
+    └─ Region（默认 96MB，超出自动分裂）
+       └─ Raft Group（多副本一致性）
+```
+
+### 分片中间件：MongoDB Sharding
+
+MongoDB 的分片由 Shards + Config Server + Mongos 路由组成：
+
+```javascript
+// MongoDB 分片配置
+
+// 1. 启用数据库分片
+sh.enableSharding("ecommerce");
+
+// 2. 对集合建立分片键索引
+db.orders.createIndex({ customer_id: 1, order_id: 1 });
+
+// 3. 对集合启用分片
+sh.shardCollection("ecommerce.orders", { customer_id: 1, order_id: 1 });
+
+// 4. 查看分片状态
+sh.status();
+
+// 5. 范围分片 vs 哈希分片
+// 范围分片（支持范围查询）
+sh.shardCollection("ecommerce.orders", { customer_id: 1 });
+
+// 哈希分片（均匀分布，避免热点）
+sh.shardCollection("ecommerce.events", { event_id: "hashed" });
+
+// 分区标签：将数据路由到特定分片
+sh.addShardTag("shard-us", "US");
+sh.addShardTag("shard-eu", "EU");
+sh.addTagRange("ecommerce.users", { region: "US" }, { region: "EU" }, "US");
+```
+
+### 分片代理中间件：Vitess（PlanetScale）
+
+Vitess 是 MySQL 分片代理，对应用透明地管理分片：
+
+```
+Vitess 架构：
+  Application → VTGate（查询路由）→ VTTablet（每个分片的 MySQL 代理）
+  Topo Server（etcd 存储 VSchema 路由信息）
+```
+
+```sql
+-- Vitess VSchema：定义分片规则
+{
+  "sharded": true,
+  "vindexes": {
+    "hash": { "type": "hash" },
+    "lookup": { "type": "consistent_lookup", "table": "lookup_table" }
+  },
+  "tables": {
+    "orders": {
+      "column_vindexes": [
+        { "column": "customer_id", "name": "hash" }
+      ]
+    }
+  }
+}
+
+-- 应用使用普通 SQL，Vitess 自动路由
+SELECT * FROM orders WHERE customer_id = 123;
+-- VTGate 将查询路由到 customer_id = 123 所在的分片
+```
+
+### 热点治理中间件实践
+
+**CockroachDB 的自动热点分裂：**
+
+```sql
+-- CockroachDB：查看热点 Range
+SELECT
+    range_id,
+    node_id,
+    crdb_internal.lease_status(range_id, node_id) AS lease,
+    crdb_internal.range_stats(range_id).qps AS qps
+FROM crdb_internal.ranges
+WHERE crdb_internal.range_stats(range_id).qps > 1000;
+
+-- 手动分裂热点 Range
+ALTER TABLE orders SPLIT AT VALUES ('hot-customer-id');
+
+-- 查看负载分布
+SELECT
+    node_id,
+    sum(qps) AS total_qps
+FROM crdb_internal.range_stats
+GROUP BY node_id
+ORDER BY total_qps DESC;
+```
+
+**Redis Cluster 的 Slot 分区：**
+
+Redis Cluster 将数据映射到 16384 个 Slot：
+
+```bash
+# Redis Cluster 分片路由
+# 键 → CRC16(key) mod 16384 → Slot → Node
+
+# 查看键对应的 Slot
+redis-cli cluster keyslot "user:12345"
+# (integer) 12933
+
+# 查看节点和 Slot 分配
+redis-cli cluster nodes
+# node1:6379@16379 ... [0-5460]
+# node2:6379@16379 ... [5461-10922]
+# node3:6379@16379 ... [10923-16383]
+
+# 在线 Reshard：迁移 Slot
+redis-cli --cluster reshard 127.0.0.1:6379 \
+  --cluster-from node1 \
+  --cluster-to node2 \
+  --cluster-slots 1000 \
+  --cluster-yes
+```
+
+### 全局索引中间件：Elasticsearch
+
+Elasticsearch 的分片设计，每个分片本身是一个 Lucene 索引：
+
+```json
+// Elasticsearch 索引分片配置
+PUT /products
+{
+  "settings": {
+    "number_of_shards": 6,           // 主分片数（创建后不可改）
+    "number_of_replicas": 1,          // 每个主分片的副本数
+    "index.routing.allocation.total_shards_per_node": 2  // 每节点最多2个分片
+  }
+}
+
+// 自定义路由：将同一用户数据路由到同一分片
+PUT /products/_doc/1?routing=user123
+{
+  "user_id": "user123",
+  "product_name": "Laptop"
+}
+
+// 查询时指定 routing（避免广播查询）
+GET /products/_search?routing=user123
+{
+  "query": {
+    "term": { "user_id": "user123" }
+  }
+}
+```
+
+### 分区再平衡中间件：Kafka Partition Reassignment
+
+Kafka 的分区再平衡通过 Reassignment 工具完成：
+
+```bash
+# Kafka 分区迁移配置
+cat > reassignment.json <<EOF
+{
+  "version": 1,
+  "partitions": [
+    {
+      "topic": "orders",
+      "partition": 0,
+      "replicas": [1, 2, 3]    // 目标副本分布
+    },
+    {
+      "topic": "orders",
+      "partition": 1,
+      "replicas": [2, 3, 4]
+    }
+  ]
+}
+EOF
+
+# 执行在线迁移
+kafka-reassign-partitions \
+  --bootstrap-server kafka:9092 \
+  --reassignment-json-file reassignment.json \
+  --execute \
+  --throttle 50000000  // 50MB/s 限速，避免影响生产流量
+
+# 验证迁移完成
+kafka-reassign-partitions \
+  --bootstrap-server kafka:9092 \
+  --reassignment-json-file reassignment.json \
+  --verify
+```
+
 ## 2026 年工业界最新进展
 
 ### 分片数据库的云原生化

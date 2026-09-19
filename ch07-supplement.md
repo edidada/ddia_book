@@ -61,6 +61,263 @@ Read Uncommitted < Read Committed < Repeatable Read < Snapshot Isolation < Seria
 - 2026 年仍有场景：金融交易、库存扣减等高冲突场景
 - TiDB 在 2023 年引入了悲观事务模型，与 MySQL 兼容
 
+## 工业界中间件软件实践
+
+### MVCC 中间件：MySQL InnoDB
+
+InnoDB 的 MVCC 实现是理解事务隔离的最佳入口：
+
+```
+InnoDB MVCC 实现：
+  每行记录有两个隐藏列：
+    - trx_id：最后修改该行的事务ID
+    - roll_pointer：指向 undo log（历史版本）
+
+  读取流程：
+    1. 获取当前 Read View（可见事务快照）
+    2. 读取行的 trx_id
+    3. 如果 trx_id 在 Read View 中不可见 → 沿 roll_pointer 找历史版本
+    4. 直到找到可见版本
+```
+
+```sql
+-- MySQL 隔离级别设置
+-- 查看当前隔离级别
+SELECT @@transaction_isolation;
+
+-- 设置隔离级别（会话级）
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ;  -- InnoDB 默认
+SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+
+-- 查看当前事务ID和活跃事务
+SELECT * FROM information_schema.innodb_trx;
+SELECT * FROM information_schema.innodb_locks;
+SELECT * FROM information_schema.innodb_lock_waits;
+
+-- 查看某个事务的锁等待
+SELECT
+    r.trx_id AS waiting_trx,
+    r.trx_mysql_thread_id AS waiting_thread,
+    b.trx_id AS blocking_trx,
+    b.trx_mysql_thread_id AS blocking_thread
+FROM information_schema.innodb_lock_waits w
+JOIN information_schema.innodb_trx b ON b.trx_id = w.blocking_trx_id
+JOIN information_schema.innodb_trx r ON r.trx_id = w.requesting_trx_id;
+```
+
+### 分布式事务中间件：Seata
+
+Seata（阿里开源）是微服务分布式事务的标杆中间件，支持多种事务模式：
+
+**AT 模式（自动补偿）：**
+
+```java
+// Seata AT 模式：对业务无侵入
+@GlobalTransactional(timeout = 60000, name = "createOrder")
+public void createOrder(Order order) {
+    // 1. 扣减库存（本地事务）
+    storageService.deduct(order.getProductId(), order.getCount());
+
+    // 2. 扣减余额（本地事务）
+    accountService.debit(order.getUserId(), order.getTotal());
+
+    // 3. 创建订单（本地事务）
+    orderDao.insert(order);
+
+    // Seata 自动管理全局事务
+    // 任何一步失败，自动执行反向补偿（undo_log）
+}
+```
+
+**TCC 模式（Try-Confirm-Cancel）：**
+
+```java
+// Seata TCC 模式：需要业务实现三个方法
+@LocalTCC
+public interface OrderTccAction {
+
+    @TwoPhaseBusinessAction(name = "createOrder",
+        commitMethod = "confirm", rollbackMethod = "cancel")
+    boolean tryCreate(BusinessActionContext ctx,
+                      @BusinessActionParameter String userId,
+                      @BusinessActionParameter BigDecimal total);
+
+    boolean confirm(BusinessActionContext ctx);
+    boolean cancel(BusinessActionContext ctx);
+}
+```
+
+### 分布式事务中间件：TiDB Percolator
+
+TiDB 使用 Percolator 模型实现分布式事务，无需独立协调者：
+
+```
+Percolator 事务流程：
+  1. Prewrite：
+     - 对每个 Key 加锁（写入 primary 锁和 secondary 锁）
+     - primary 锁是事务的"锚点"
+  2. Commit：
+     - 先提交 primary Key（删锁，写新版本）
+     - 异步清理 secondary Key
+  3. 故障恢复：
+     - 如果遇到锁，检查 primary Key 状态
+     - primary 已提交 → 提交；primary 未提交 → 回滚
+```
+
+```sql
+-- TiDB 事务执行
+BEGIN;
+-- 乐观事务（默认）
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+
+-- TiDB 乐观事务在高冲突场景需要重试
+-- 悲观事务模式（4.0+，与 MySQL 兼容）
+SET tidb_txn_mode = 'pessimistic';
+BEGIN;
+SELECT balance FROM accounts WHERE id = 1 FOR UPDATE;  -- 加悲观锁
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+```
+
+### 事务隔离中间件：PostgreSQL SSI
+
+PostgreSQL 的 SSI（可串行化快照隔离）通过 SIREAD 锁检测写偏序异常：
+
+```sql
+-- PostgreSQL 隔离级别设置
+SET default_transaction_isolation = 'serializable';
+
+-- SSI 示例：医院值班管理
+-- 两个事务同时检查"至少有2人值班"条件，都可能通过检查后都退出
+
+-- 事务 A
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT count(*) FROM oncall WHERE active = true;
+-- count = 3
+-- 检查 count >= 2，满足
+UPDATE oncall SET active = false WHERE doctor = 'Alice';
+COMMIT;  -- 可能成功
+
+-- 事务 B（同时执行）
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+SELECT count(*) FROM oncall WHERE active = true;
+-- count = 3（事务A还没提交）
+UPDATE oncall SET active = false WHERE doctor = 'Bob';
+COMMIT;  -- PostgreSQL SSI 检测到写偏序，中止此事务
+-- ERROR: could not serialize access due to read/write dependencies
+```
+
+### Saga 模式中间件：Temporal
+
+Temporal 是 Saga 模式的标杆执行引擎：
+
+```go
+// Temporal Saga 模式：订单创建流程
+func CreateOrderWorkflow(ctx workflow.Context, order Order) error {
+    // Saga 补偿函数链
+    var compensations []func(ctx workflow.Context) error
+
+    // Step 1: 扣减库存
+    err := workflow.ExecuteActivity(ctx, DeductInventory, order).Get(ctx, nil)
+    if err != nil {
+        return err
+    }
+    compensations = append(compensations, RestoreInventory)
+
+    // Step 2: 扣减余额
+    err = workflow.ExecuteActivity(ctx, DeductBalance, order).Get(ctx, nil)
+    if err != nil {
+        // 执行补偿：回滚库存
+        return workflow.ExecuteActivity(ctx, RestoreInventory, order).Get(ctx, nil)
+    }
+    compensations = append(compensations, RestoreBalance)
+
+    // Step 3: 创建订单
+    err = workflow.ExecuteActivity(ctx, CreateOrder, order).Get(ctx, nil)
+    if err != nil {
+        // 按逆序执行所有补偿
+        for i := len(compensations) - 1; i >= 0; i-- {
+            workflow.ExecuteActivity(ctx, compensations[i], order).Get(ctx, nil)
+        }
+        return err
+    }
+
+    return nil
+}
+```
+
+### 事务性 Kafka 中间件
+
+Kafka 的事务 API 实现端到端精确一次语义：
+
+```java
+// Kafka 事务性生产者
+Properties props = new Properties();
+props.put("transactional.id", "order-processor-1");  // 事务 ID（跨重启幂等）
+props.put("enable.idempotence", true);                // 幂等生产者
+props.put("acks", "all");
+
+Producer<String, String> producer = new KafkaProducer<>(props);
+
+// 初始化事务
+producer.initTransactions();
+
+try {
+    producer.beginTransaction();
+
+    // 消费 → 处理 → 生产（原子操作）
+    for (ConsumerRecord<String, String> record : consumer.poll(Duration.ofMillis(100))) {
+        String result = process(record.value());
+        producer.send(new ProducerRecord<>("processed", record.key(), result));
+    }
+
+    // 提交消费者偏移量（作为事务的一部分）
+    producer.sendOffsetsToTransaction(
+        consumer_offsets,
+        consumer.groupMetadata()
+    );
+
+    producer.commitTransaction();
+} catch (Exception e) {
+    producer.abortTransaction();
+}
+```
+
+### FoundationDB 中间件
+
+FDB 提供严格可串行化的 KV 事务，Apple 用其支撑 iCloud 存储：
+
+```python
+# FDB Python 客户端
+import fdb
+
+db = fdb.open()
+
+# FDB 事务
+@fdb.transactional
+def transfer(db, from_account, to_account, amount):
+    # 读取余额（乐观并发）
+    from_balance = db[from_account]
+    to_balance = db[to_account]
+
+    if int(from_balance) < amount:
+        raise Exception("Insufficient balance")
+
+    # 原子写入
+    db[from_account] = str(int(from_balance) - amount)
+    db[to_account] = str(int(to_balance) + amount)
+
+# 执行事务
+transfer(db, b"account:1", b"account:2", 100)
+
+# FDB 自动处理冲突检测、重试、快照隔离
+# 严格可串行化：所有事务按某顺序排列执行
+```
+
 ## 2026 年工业界最新进展
 
 ### 分布式事务的简化

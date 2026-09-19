@@ -26,6 +26,145 @@ DDIA 写作时（2017），可靠性的讨论主要聚焦于硬件故障、软�
 - **Platform Engineering**：2023-2026 年最热门的工程实践之一。Backstage（Spotify 开源的内部开发者门户）、Port、Humanitec 等平台兴起，内部开发者平台（IDP）成为提升可维护性的关键手段。
 - **基础设施即代码（IaC）**：Terraform/OpenTofu、Pulumi 等工具的成熟，使基础设施配置可版本化、可审计、可回滚。
 
+## 工业界中间件软件实践
+
+### 可靠性实践：从混沌工程到韧性工程
+
+**Netflix Chaos Monkey 与 Gremlin**
+
+Netflix 的 Chaos Monkey 是混沌工程的起源。它会在工作日随机杀掉生产环境中的实例，迫使工程师构建能容忍单节点故障的系统。到 2026 年，Gremlin 将混沌工程产品化，提供了更精细的故障注入能力：
+
+- **CPU/内存压力注入**：模拟资源争抢
+- **网络延迟/丢包注入**：模拟网络分区
+- **进程杀掉注入**：模拟节点宕机
+
+在 Kubernetes 生态中，**Chaos Mesh**（CNCF 项目）是使用最广泛的混沌工程工具，支持容器级别的故障注入：
+
+```yaml
+# Chaos Mesh 示例：注入网络延迟
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: web-delay
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces:
+      - production
+    labelSelectors:
+      app: web-service
+  delay:
+    latency: "200ms"
+    correlation: "0"
+    jitter: "0"
+  duration: "30s"
+```
+
+**韧性工程实践案例——Stripe**
+
+Stripe 在 2023 年公开了其韧性工程框架：每个核心服务定义"依赖故障时的降级行为"。例如，当欺诈检测服务不可用时，支付服务从"实时拦截"降级为"事后异步审计"，保证支付功能可用。这种 graceful degradation 策略是 2026 年可靠性工程的标配。
+
+### 可扩展性实践：Kubernetes 与 HPA/VPA
+
+**Kubernetes HPA（Horizontal Pod Autoscaler）**
+
+K8s 的 HPA 是弹性伸缩的基础，但默认仅基于 CPU/内存指标。2026 年的最佳实践是结合 **KEDA（Kubernetes Event-Driven Autoscaling）** 基于自定义指标伸缩：
+
+```yaml
+# KEDA 示例：基于 Kafka 消费滞后伸缩
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: kafka-consumer-scaler
+spec:
+  scaleTargetRef:
+    name: kafka-consumer-deployment
+  minReplicaCount: 3
+  maxReplicaCount: 100
+  triggers:
+    - type: kafka
+      metadata:
+        topic: orders
+        consumerGroup: order-processor
+        lagThreshold: "1000"
+```
+
+当 Kafka 的 `orders` topic 消费滞后超过 1000 条时，自动扩展消费副本。这种模式将负载指标与伸缩策略直接关联，比基于 CPU 的伸缩更精确。
+
+**Serverless 数据库的弹性——Aurora Serverless v2**
+
+AWS Aurora Serverless v2 的弹性能力是 2026 年云原生数据库的标杆：
+
+- 从 0.5 ACU（Aurora Capacity Unit）到 128 ACU，秒级伸缩
+- 读写分离：只读副本可与主实例共享存储，零延迟复制
+- 暂停/恢复：无流量时自动暂停，有流量时秒级恢复
+
+### 可维护性实践：可观测性平台
+
+**Prometheus + Grafana + Loki + Tempo**
+
+CNCF 的可观测性"黄金四件套"在 2026 年仍是主流：
+
+- **Prometheus**：指标采集与时序存储。通过 PromQL 查询指标
+- **Grafana**：可视化仪表盘，支持多数据源
+- **Loki**：日志聚合，与 Prometheus 标签体系一致
+- **Tempo**：分布式追踪，基于 OpenTelemetry 标准
+
+**OpenTelemetry 统一标准**
+
+OpenTelemetry（OTel）在 2023 年成为 CNCF 第二活跃项目（仅次于 Kubernetes），到 2026 年已统一了可观测性三大支柱：
+
+```python
+# Python 应用接入 OpenTelemetry
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+trace.set_tracer_provider(TracerProvider())
+trace.get_tracer_provider().add_span_processor(
+    BatchSpanProcessor(OTLPSpanExporter(endpoint="otel-collector:4317"))
+)
+
+# 自动注入 span
+tracer = trace.get_tracer(__name__)
+with tracer.start_as_current_span("process_order"):
+    # 业务逻辑
+    process_order(order_id)
+```
+
+**Datadog / Honeycomb 的全栈可观测性**
+
+Datadog 在 2024-2026 年整合了 APM（应用性能监控）、Log、Infra 监控、RUM（真实用户监控）和 CI 可视化，成为"一站式"可观测性平台。Honeycomb 则推动了"高基数观测"范式——每条事件都携带丰富的上下文标签，支持任意维度切片查询。
+
+### 平台工程实践：Backstage 与内部开发者平台
+
+**Backstage（Spotify 开源）**
+
+Backstage 是 2026 年最流行的内部开发者门户（IDP），提供：
+
+- **软件目录（Service Catalog）**：统一管理所有微服务的元信息
+- **模板（Templates）**：一键创建符合最佳实践的微服务脚手架
+- **插件生态**：集成 CI/CD、文档、监控、依赖管理等
+
+```yaml
+# Backstage 软件目录条目示例
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: order-service
+  description: 订单处理服务
+spec:
+  type: service
+  lifecycle: production
+  owner: payments-team
+  system: commerce
+  dependsOn:
+    - resource:postgres-orders
+    - component:kafka-cluster
+```
+
 ## 2026 年工业界最新进展
 
 ### AI 驱动的系统运维

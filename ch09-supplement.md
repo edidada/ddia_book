@@ -61,6 +61,320 @@
 | EPaxos | 1 RTT（无冲突） | 高（无冲突） | 中等 | 很高 |
 | Fast Paxos | < 1 RTT | 高 | 复杂 | 高 |
 
+## 工业界中间件软件实践
+
+### Raft 共识中间件：etcd
+
+etcd 是 Raft 共识协议最典型的工业实现，也是 Kubernetes 的核心依赖：
+
+```
+etcd 集群架构：
+  Client → etcd Leader（读写） → Follower（读）
+  └─ Raft Log：所有变更先写入日志再提交
+  └─ MVCC：多版本并发控制，支持历史版本查询
+```
+
+```bash
+# etcd 基本操作
+# 写入键值对（通过 Raft 共识）
+etcdctl put /services/order-service '{"host":"10.0.1.5","port":8080}'
+
+# 读取
+etcdctl get /services/order-service
+
+# 带租约的键（用于服务注册的心跳机制）
+LEASE_ID=$(etcdctl lease grant 30 | awk '{print $2}')
+etcdctl put --lease=$LEASE_ID /services/order-service/192.168.1.1 '{"alive":true}'
+# 30秒内不续约则自动删除（服务下线）
+
+# 事务：原子的条件写入
+etcdctl txn <<EOF
+mod(/config/version) > 5     # 条件：当前版本 > 5
+
+# 成功则执行
+put /config/value "new_value"
+put /config/version 6
+EOF
+
+# Watch：监听键变化（配置热更新）
+etcdctl watch /config/ --prefix
+```
+
+**etcd 在 Kubernetes 中的作用：**
+
+```go
+// Kubernetes 使用 etcd 存储所有集群状态
+// 每个 Pod、Service、Deployment 的 Spec 和 Status 都存在 etcd 中
+
+// K8s Controller 通过 List-Watch 机制感知集群状态变化
+// List：获取全量数据
+// Watch：监听增量变化（基于 etcd 的 Watch API + ResourceVersion）
+
+// 伪代码：K8s Controller 的 List-Watch 模式
+func (c *Controller) Run() {
+    // List: 全量获取当前状态
+    pods, rv := apiserver.List("pods")
+    for _, pod := range pods {
+        c.workQueue.Add(pod)
+    }
+
+    // Watch: 监听增量变化
+    watcher := apiserver.Watch("pods", rv)
+    for event := range watcher.Events {
+        switch event.Type {
+        case ADDED:
+            c.workQueue.Add(event.Pod)
+        case MODIFIED:
+            c.workQueue.Update(event.Pod)
+        case DELETED:
+            c.workQueue.Delete(event.Pod)
+        }
+    }
+}
+```
+
+### Raft 共识中间件：TiKV（TiDB 存储层）
+
+TiKV 将 Raft 应用于每个 Region，实现强一致的多副本存储：
+
+```
+TiKV Raft 架构：
+  每个 Region（96MB 数据范围）→ 独立的 Raft Group
+  └─ Leader：处理读写请求
+  └─ Followers：同步日志
+  └─ Learner：非投票成员（跨区域只读）
+```
+
+```rust
+// TiKV 的 Raft 实现（简化）
+// 每个 Region 对应一个 RaftGroup
+struct RegionRaft {
+    region_id: u64,
+    raft_group: RawNode<PeerStorage>,
+    apply_state: ApplyState,
+}
+
+impl RegionRaft {
+    fn propose(&mut self, cmd: Command) {
+        // 将写请求 propose 给 Raft
+        self.raft_group.propose(cmd.encode());
+    }
+
+    fn step(&mut self, msg: RaftMessage) {
+        // 处理 Raft 消息（投票、心跳、AppendEntries）
+        self.raft_group.step(msg.message);
+    }
+
+    fn ready(&mut self) -> Ready {
+        // 获取需要持久化和发送的 Raft 状态
+        self.raft_group.ready()
+    }
+}
+```
+
+### Raft 共识中间件：Kafka KRaft
+
+Kafka 4.0 废弃 ZooKeeper，使用 KRaft 模式自管理元数据：
+
+```
+Kafka KRaft 架构：
+  Controller Quorum（Raft 集群）
+    └─ Active Controller：处理元数据变更
+    └─ Standby Controllers：同步元数据日志
+  Brokers：从 Controller 同步元数据
+```
+
+```bash
+# Kafka KRaft 模式配置
+# server.properties
+process.roles=broker,controller    # 同时作为 Broker 和 Controller
+node.id=1
+controller.quorum.voters=1@broker1:9093,2@broker2:9093,3@broker3:9093
+controller.listener.names=CONTROLLER
+listeners=PLAINTEXT://:9092,CONTROLLER://:9093
+inter.broker.listener.name=PLAINTEXT
+
+# 格式化 KRaft 元数据存储
+bin/kafka-storage.sh format --config config/kraft/server.properties \
+  --cluster-id $(bin/kafka-storage.sh random-uuid)
+
+# 启动（无需 ZooKeeper）
+bin/kafka-server-start.sh config/kraft/server.properties
+```
+
+### 分布式锁中间件：Redis / etcd
+
+**Redis 分布式锁（RedLock 算法）：**
+
+```python
+import redis
+import time
+import uuid
+
+def acquire_lock(redis_clients, lock_name, acquire_timeout=10, lock_timeout=30):
+    identifier = str(uuid.uuid4())
+    lock_key = f"lock:{lock_name}"
+    end = time.time() + acquire_timeout
+
+    while time.time() < end:
+        # 尝试在多个 Redis 实例上加锁
+        acquired = 0
+        quorum = len(redis_clients) // 2 + 1
+
+        for client in redis_clients:
+            if client.set(lock_key, identifier, nx=True, ex=lock_timeout):
+                acquired += 1
+
+        if acquired >= quorum:
+            return identifier  # 成功获取锁
+        else:
+            # 失败，释放所有已获取的锁
+            for client in redis_clients:
+                client.delete(lock_key)
+
+        time.sleep(0.01)
+
+    return None  # 超时
+
+def release_lock(redis_clients, lock_name, identifier):
+    # 使用 Lua 脚本保证原子性
+    script = """
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+    else
+        return 0
+    end
+    """
+    for client in redis_clients:
+        client.eval(script, 1, f"lock:{lock_name}", identifier)
+```
+
+**etcd 分布式锁：**
+
+```go
+import "go.etcd.io/etcd/client/v3/concurrency"
+
+func acquireEtcdLock(client *clientv3.Client, lockName string) (*concurrency.Mutex, error) {
+    session, err := concurrency.NewSession(client)
+    if err != nil {
+        return nil, err
+    }
+
+    mutex := concurrency.NewMutex(session, lockName)
+    err = mutex.Lock(context.TODO())
+    if err != nil {
+        return nil, err
+    }
+    // 执行临界区操作...
+    // mutex.Unlock(context.TODO())
+    return mutex, nil
+}
+```
+
+### 强一致性中间件：CockroachDB Parallel Commits
+
+CockroachDB 的 Parallel Commit 优化了 2PC 的尾延迟：
+
+```sql
+-- CockroachDB：分布式事务（Parallel Commit 自动启用）
+BEGIN;
+
+-- 转账事务：跨节点操作
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;  -- Region: us-east
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;  -- Region: eu-west
+
+-- 显式设置优先级（影响冲突解决）
+SET TRANSACTION PRIORITY HIGH;
+
+COMMIT;
+
+-- Parallel Commit 优化：
+-- 传统 2PC：Prewrite (1-RTT) → Commit (1-RTT) = 2-RTT
+-- Parallel Commit：Prewrite + Commit 并行 = 1-RTT（无冲突时）
+```
+
+**CockroachDB 的 Stale Read（过时读）：**
+
+```sql
+-- CockroachDB：降低一致性换取延迟
+-- 默认：强一致性（读需到 Leader + Quorum）
+-- 强一致读
+SELECT * FROM orders WHERE id = 123;
+
+-- 过时读：从任意副本读（延迟低）
+SELECT * FROM orders AS OF SYSTEM TIME '-5s' WHERE id = 123;
+
+-- 按区域优化读取
+SET locality_optimizer = on;
+-- 系统自动优先从本地 Region 读取（如果有最新副本）
+```
+
+### 强一致性中间件：Spanner TrueTime
+
+```sql
+-- Google Spanner：TrueTime 保证外部一致性
+-- 写入操作必须等待 commit wait
+
+BEGIN TRANSACTION;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;
+-- Commit Wait：等待 ~4ms 确保 commit timestamp < TrueTime latest
+-- 这保证了所有读操作都能看到已提交的数据
+
+-- 读时间戳
+SELECT * FROM accounts
+  WHERE id = 1
+  AND TIMESTAMP > '2026-09-19T10:00:00Z';
+-- Spanner 保证返回所有 commit_ts <= read_ts 的数据
+```
+
+### 共识协议中间件：Consul（Raft）
+
+HashiCorp Consul 使用 Raft 进行服务发现和配置管理：
+
+```hcl
+# Consul 配置（server 模式）
+server = true
+bootstrap_expect = 3           # 3 个 server 节点
+raft_protocol = 3              # Raft 协议版本
+raft_snapshot_interval = "30s"
+raft_trailing_logs = 10240
+
+# 使用 Consul KV 存储配置
+# consul kv 命令
+consul kv put config/database/url "postgres://db:5432"
+consul kv get config/database/url
+consul kv delete config/database/url
+```
+
+```go
+// Go 应用使用 Consul 配置
+import "github.com/hashicorp/consul/api"
+
+client, _ := api.NewClient(api.DefaultConfig())
+kv := client.KV()
+
+// 获取配置
+pair, _, err := kv.Get("config/database/url", nil)
+
+// Watch 配置变化
+go func() {
+    var lastIndex uint64
+    for {
+        pairs, meta, _ := kv.List("config/", &api.QueryOptions{
+            WaitIndex: lastIndex,
+        })
+        if meta.LastIndex > lastIndex {
+            lastIndex = meta.LastIndex
+            for _, p := range pairs {
+                fmt.Printf("%s = %s\n", p.Key, p.Value)
+            }
+        }
+    }
+}()
+```
+
 ## 2026 年工业界最新进展
 
 ### Raft 的持续优化

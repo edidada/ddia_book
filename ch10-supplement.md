@@ -55,6 +55,310 @@
 - **DAG（有向无环图）**：所有现代批处理引擎（Spark、Flink、Airflow）都以 DAG 表达计算逻辑
 - **不可变输入**：函数式编程的纯粹性——输入数据不可变，输出是新文件
 
+## 工业界中间件软件实践
+
+### 批处理中间件：Apache Spark
+
+Spark 是 2026 年大规模批处理的事实标准，其核心抽象是 RDD/DataFrame：
+
+**Spark DataFrame API（结构化数据处理）：**
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+spark = SparkSession.builder \
+    .appName("BatchProcessing") \
+    .config("spark.sql.adaptive.enabled", "true") \
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+    .getOrCreate()
+
+# 读取数据（支持 Parquet、Delta、Iceberg 等格式）
+orders = spark.read.parquet("s3://data/orders/")
+customers = spark.read.parquet("s3://data/customers/")
+
+# Spark SQL 风格：声明式批处理
+result = spark.sql("""
+    SELECT
+        c.country,
+        o.order_date,
+        COUNT(*) AS order_count,
+        SUM(o.total) AS revenue
+    FROM orders o
+    JOIN customers c ON o.customer_id = c.id
+    WHERE o.order_date >= '2026-01-01'
+    GROUP BY c.country, o.order_date
+    ORDER BY revenue DESC
+""")
+
+# 写入结果（支持多种格式）
+result.write \
+    .mode("overwrite") \
+    .parquet("s3://data/output/daily_revenue/")
+
+# 写入到数据湖仓（Delta Lake）
+result.write.format("delta") \
+    .mode("overwrite") \
+    .saveAsTable("analytics.daily_revenue")
+```
+
+**Spark 的核心设计：**
+
+| 抽象 | 说明 | 特点 |
+|------|------|------|
+| RDD | 弹性分布式数据集 | 不可变、分区、血缘关系 |
+| DataFrame | 结构化数据 | 带 Schema 的 RDD，向量化执行 |
+| Catalyst Optimizer | 查询优化器 | 逻辑计划→物理计划，RBO+CBO |
+| Tungsten | 执行引擎 | 堆外内存、向量化、代码生成 |
+
+### 批处理中间件：Apache Iceberg + Spark
+
+Iceberg 表格式配合 Spark 实现数据湖仓：
+
+```sql
+-- Spark SQL：创建 Iceberg 表
+CREATE TABLE iceberg.orders (
+    order_id STRING,
+    customer_id STRING,
+    total DECIMAL(10,2),
+    status STRING,
+    event_time TIMESTAMP
+)
+USING iceberg
+PARTITIONED BY (days(event_time))
+STORED AS PARQUET
+TBLPROPERTIES (
+    'write.format.default' = 'parquet',
+    'write.parquet.compression-codec' = 'zstd',
+    'write.distribution-mode' = 'hash'
+);
+
+-- 批量写入
+INSERT INTO iceberg.orders
+SELECT * FROM staging.orders;
+
+-- 时间旅行：查询历史版本
+SELECT * FROM iceberg.orders.snapshots;
+SELECT * FROM iceberg.orders VERSION AS OF 1234567890;
+
+-- 增量读取（CDC 式消费）
+SELECT * FROM iceberg.orders
+WHERE event_time > '2026-09-19 00:00:00';
+
+-- Schema 演化：安全添加列
+ALTER TABLE iceberg.orders ADD COLUMN session_id STRING AFTER status;
+
+-- 分区演化：从日分区改为月分区
+ALTER TABLE iceberg.orders REPLACE PARTITION FIELD
+    months(event_time) AS month;
+```
+
+### 批处理中间件：Trino（联邦查询）
+
+Trino 支持 SQL 查询多种数据源，无需预先 ETL：
+
+```sql
+-- Trino：联邦查询 MySQL 订单 + Hive 日志
+SELECT
+    o.order_id,
+    c.customer_name,
+    l.page_count,
+    o.total
+FROM mysql.ecommerce.orders o
+JOIN mysql.ecommerce.customers c ON o.customer_id = c.id
+LEFT JOIN (
+    SELECT customer_id, count(*) AS page_count
+    FROM hive.web_logs.page_views
+    WHERE dt = '2026-09-19'
+    GROUP BY customer_id
+) l ON l.customer_id = c.id
+WHERE o.order_date = DATE '2026-09-19'
+ORDER BY o.total DESC
+LIMIT 100;
+```
+
+```sql
+-- Trino 配置数据源连接器（catalog）
+-- catalog/mysql.properties
+connector.name=mysql
+connection-url=jdbc:mysql://mysql.db:3306
+connection-user=trino
+connection-password=***
+
+-- catalog/hive.properties
+connector.name=hive
+hive.metastore=thrift
+hive.metastore.uri=thrift://hive-metastore:9083
+hive.s3.endpoint=https://s3.amazonaws.com
+hive.s3.aws-access-key=***
+hive.s3.aws-secret-key=***
+```
+
+### 批处理中间件：DuckDB
+
+DuckDB 是嵌入式分析数据库，无需部署，适合"最后一公里"分析：
+
+```python
+import duckdb
+
+# 直接查询 Parquet 文件（无需导入）
+result = duckdb.sql("""
+    SELECT
+        order_date,
+        count(*) AS orders,
+        sum(total) AS revenue,
+        avg(total) AS avg_order_value
+    FROM read_parquet('orders/*.parquet')
+    WHERE order_date >= '2026-01-01'
+    GROUP BY order_date
+    ORDER BY order_date
+""").fetchdf()
+
+# 直接查询 CSV
+csv_result = duckdb.sql("""
+    SELECT * FROM 'logs/access_log_*.csv'
+    WHERE status = 200
+""").fetchall()
+
+# 跨格式查询
+mixed = duckdb.sql("""
+    SELECT o.order_id, c.customer_name
+    FROM read_parquet('orders.parquet') o
+    JOIN read_csv('customers.csv') c ON o.customer_id = c.id
+""").df()
+```
+
+### 数据管道中间件：Apache Airflow
+
+Airflow 是批处理管道编排的事实标准：
+
+```python
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+from airflow.providers.snowflake.operators.snowflake import SnowflakeOperator
+from datetime import datetime, timedelta
+
+default_args = {
+    'owner': 'data-team',
+    'retries': 3,
+    'retry_delay': timedelta(minutes=5),
+}
+
+dag = DAG(
+    'daily_revenue_pipeline',
+    default_args=default_args,
+    schedule_interval='0 2 * * *',  # 每天2点
+    start_date=datetime(2026, 1, 1),
+    catchup=False,
+)
+
+# 1. 从 Kafka 同步数据到 Iceberg
+sync_task = SparkSubmitOperator(
+    task_id='sync_kafka_to_iceberg',
+    application='/jobs/sync_kafka.py',
+    conn_id='spark_cluster',
+    dag=dag,
+)
+
+# 2. 计算每日收入
+compute_task = SparkSubmitOperator(
+    task_id='compute_daily_revenue',
+    application='/jobs/compute_revenue.py',
+    conn_id='spark_cluster',
+    dag=dag,
+)
+
+# 3. 加载到 Snowflake 数据仓库
+load_task = SnowflakeOperator(
+    task_id='load_to_snowflake',
+    sql="""
+        COPY INTO analytics.daily_revenue
+        FROM @iceberg_stage/daily_revenue/
+        FILE_FORMAT = (TYPE = PARQUET);
+    """,
+    snowflake_conn_id='snowflake_prod',
+    dag=dag,
+)
+
+# 4. 通知下游
+notify_task = BashOperator(
+    task_id='notify_downstream',
+    bash_command='curl -X POST https://api.example.com/notify',
+    dag=dag,
+)
+
+# 依赖关系
+sync_task >> compute_task >> load_task >> notify_task
+```
+
+### 数据转换中间件：dbt
+
+dbt 将数据管道的定义从命令式脚本转变为声明式 SQL：
+
+```sql
+-- dbt 模型：每日收入分析
+{{ config(materialized='incremental', unique_key='order_date') }}
+
+SELECT
+    order_date,
+    count(*) AS order_count,
+    sum(total) AS revenue,
+    avg(total) AS avg_order_value
+FROM {{ ref('stg_orders') }}
+WHERE status = 'PAID'
+
+{% if is_incremental() %}
+    AND order_date > (select max(order_date) from {{ this }})
+{% endif %}
+
+GROUP BY order_date
+```
+
+```yaml
+# dbt 项目配置
+# dbt_project.yml
+models:
+  ecommerce:
+    staging:
+      +materialized: view
+      +schema: staging
+    marts:
+      +materialized: incremental
+      +schema: analytics
+      +cluster_by: ['order_date']
+```
+
+### 向量化中间件：Polars
+
+Polars（Rust）是 DataFrame 领域的性能标杆：
+
+```python
+import polars as pl
+
+# Polars 惰性执行（查询优化）
+lf = pl.scan_parquet("orders/*.parquet")
+
+result = (
+    lf.filter(pl.col("order_date") >= "2026-01-01")
+      .groupby("customer_id")
+      .agg([
+          pl.col("total").sum().alias("total_spent"),
+          pl.col("order_id").count().alias("order_count"),
+          pl.col("total").mean().alias("avg_order_value")
+      ])
+      .filter(pl.col("total_spent") > 1000)
+      .sort("total_spent", descending=True)
+      .collect()  # 触发执行
+)
+
+# Polars 比 Pandas 快 5-50 倍，原因：
+# 1. Rust 实现，无 GIL
+# 2. 多线程并行
+# 3. 向量化执行（SIMD）
+# 4. 惰性求值 + 查询优化
+```
+
 ## 2026 年工业界最新进展
 
 ### 数据湖仓（Data Lakehouse）

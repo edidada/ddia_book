@@ -35,6 +35,221 @@ DDIA 在 2017 年讨论了关系模型 vs 文档模型的取舍。到 2026 年�
 | Schema-less + Soft Schema | 底层无模式，上层有约定 | 快速迭代应用 | MongoDB + JSON Schema |
 | Semantic Schema | 嵌入语义信息 | AI 应用 | Vector + Knowledge Graph |
 
+## 工业界中间件软件实践
+
+### 关系模型中间件：MySQL 与 PostgreSQL 生态
+
+**MySQL——最广泛部署的关系数据库**
+
+MySQL 在 2026 年仍是互联网行业最广泛部署的关系数据库。其核心数据模型能力：
+
+- **InnoDB 存储引擎**：支持行级锁、MVCC、外键约束
+- **JSON 类型**：MySQL 5.7+ 原生支持 JSON 列类型，可建函数索引
+- **窗口函数**：MySQL 8.0+ 支持 ROW_NUMBER、RANK 等 OLAP 分析函数
+- **CTE（公共表表达式）**：MySQL 8.0+ 支持递归查询，适合树形数据
+
+```sql
+-- MySQL JSON 查询示例：模糊匹配文档中的字段
+SELECT * FROM products
+WHERE JSON_EXTRACT(attributes, '$.color') = 'red'
+  AND JSON_CONTAINS(tags, '"premium"');
+
+-- MySQL 8.0 递归 CTE：查询组织架构树
+WITH RECURSIVE org_tree AS (
+    SELECT id, name, manager_id, 1 AS level
+    FROM employees WHERE manager_id IS NULL
+    UNION ALL
+    SELECT e.id, e.name, e.manager_id, ot.level + 1
+    FROM employees e JOIN org_tree ot ON e.manager_id = ot.id
+)
+SELECT * FROM org_tree ORDER BY level, name;
+```
+
+**PostgreSQL——扩展能力最强的关系数据库**
+
+PostgreSQL 的"扩展生态"是其最大优势，使其可充当多种数据模型角色：
+
+| 扩展 | 数据模型能力 | 典型场景 |
+|------|------------|---------|
+| `pgvector` | 向量模型 | 语义搜索、RAG |
+| `TimescaleDB` | 时序模型 | IoT、监控 |
+| `PostGIS` | 地理空间模型 | 地图、位置服务 |
+| `Apache AGE` | 图模型（Cypher） | 知识图谱 |
+| `Citus` | 分布式关系模型 | 水平扩展 |
+
+```sql
+-- pgvector 示例：向量相似搜索
+CREATE EXTENSION vector;
+CREATE TABLE documents (id bigserial, content text, embedding vector(1536));
+
+-- 创建 HNSW 索引加速近似最近邻搜索
+CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops);
+
+-- 语义搜索：查找与查询向量最相近的文档
+SELECT content, 1 - (embedding <=> $query_vector) AS similarity
+FROM documents
+ORDER BY embedding <=> $query_vector
+LIMIT 10;
+```
+
+### 文档模型中间件：MongoDB
+
+MongoDB 是文档模型的代表，其 BSON（Binary JSON）格式支持丰富的嵌套结构：
+
+```javascript
+// MongoDB 文档结构示例：电商产品
+db.products.insertOne({
+    _id: ObjectId("..."),
+    name: "iPhone 16 Pro",
+    price: 999,
+    attributes: {
+        color: "titanium-blue",
+        storage: [128, 256, 512, 1024],
+        display: { size: 6.3, type: "OLED" }
+    },
+    tags: ["premium", "5g", "new"],
+    reviews: [
+        { user: "alice", rating: 5, comment: "Great!" },
+        { user: "bob", rating: 4, comment: "Expensive but worth it" }
+    ]
+});
+
+// 聚合管道：多阶段文档处理
+db.products.aggregate([
+    { $match: { "tags": "premium" } },
+    { $unwind: "$attributes.storage" },
+    { $group: {
+        _id: "$attributes.storage",
+        avgPrice: { $avg: "$price" }
+    }},
+    { $sort: { avgPrice: -1 } }
+]);
+```
+
+MongoDB 的 Schema 演化能力通过 `validator` 实现"软 Schema"：
+
+```javascript
+// 定义 JSON Schema 校验规则
+db.createCollection("users", {
+    validator: {
+        $jsonSchema: {
+            bsonType: "object",
+            required: ["name", "email"],
+            properties: {
+                name: { bsonType: "string" },
+                email: { bsonType: "string", pattern: "^.+@.+$" },
+                age: { bsonType: "int", minimum: 0 }
+            }
+        }
+    }
+});
+```
+
+### 图模型中间件：Neo4j
+
+Neo4j 使用属性图模型，Cypher 查询语言是其核心：
+
+```cypher
+// Neo4j Cypher：社交推荐查询
+// 查找"朋友的朋友"中与当前用户有共同兴趣的人
+MATCH (me:User {name: 'Alice'})-[:KNOWS]->(friend)-[:KNOWS]->(fof)
+WHERE NOT (me)-[:KNOWS]->(fof)
+  AND (fof)-[:INTERESTED_IN]->(:Topic)<-[:INTERESTED_IN]-(me)
+RETURN fof.name AS recommendation, count(*) AS commonInterests
+ORDER BY commonInterests DESC
+LIMIT 5;
+```
+
+**图数据库在 GraphRAG 中的应用（2024-2026）：**
+
+```cypher
+// 将知识图谱用于 LLM 检索增强
+// 先查询相关子图，再将结果作为 LLM 上下文
+MATCH (entity:Entity {name: 'Amazon'})
+    -[:RELATES_TO*1..2]->(related:Entity)
+RETURN entity, related
+```
+
+### 向量模型中间件：Milvus 与 pgvector
+
+**Milvus——专用向量数据库**
+
+Milvus 支持多种 ANN 索引和混合检索：
+
+```python
+from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType
+
+# 连接 Milvus
+connections.connect(host="localhost", port="19530")
+
+# 定义集合 Schema
+fields = [
+    FieldSchema(name="id", dtype=DataType.INT64, is_primary=True),
+    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1536),
+    FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=512)
+]
+schema = CollectionSchema(fields, "文档语义搜索集合")
+collection = Collection("documents", schema)
+
+# 创建 HNSW 索引
+collection.create_index("embedding", {
+    "index_type": "HNSW",
+    "metric_type": "COSINE",
+    "params": {"M": 16, "efConstruction": 256}
+})
+
+# 向量搜索 + 标量过滤（混合检索）
+results = collection.search(
+    data=[query_embedding],
+    anns_field="embedding",
+    param={"metric_type": "COSINE", "params": {"ef": 64}},
+    limit=10,
+    expr='text like "%AI%"'  # 标量过滤
+)
+```
+
+### 多模型中间件：SurrealDB
+
+SurrealDB 是 2023-2026 年崛起的多模型数据库，单一引擎支持文档、关系、图模型：
+
+```sql
+-- SurrealDB：同时使用关系和图查询
+
+-- 创建文档
+CREATE person:alice SET name = 'Alice', age = 30;
+CREATE person:bob SET name = 'Bob', age = 25;
+
+-- 图关系
+RELATE person:alice -> knows -> person:bob SET since = '2024-01-01';
+
+-- SQL 式关系查询
+SELECT * FROM person WHERE age > 20;
+
+-- 图遍历查询
+SELECT ->knows->person.name AS friends FROM person:alice;
+```
+
+### 联邦查询中间件：Trino
+
+Trino（原 PrestoSQL）支持跨多种数据源的联邦查询：
+
+```sql
+-- Trino 跨数据源联邦查询示例
+-- 将 MySQL 订单数据与 Hive 中的日志数据 JOIN
+SELECT
+    o.order_id,
+    o.customer_id,
+    c.customer_name,
+    COUNT(l.page_view_id) AS views
+FROM mysql.orders o
+JOIN mysql.customers c ON o.customer_id = c.id
+JOIN hive.web_logs.page_views l ON l.customer_id = c.id
+WHERE o.order_date >= DATE '2026-01-01'
+GROUP BY o.order_id, o.customer_id, c.customer_name
+ORDER BY views DESC
+LIMIT 100;
+```
+
 ## 2026 年工业界最新进展
 
 ### 向量数据模型
